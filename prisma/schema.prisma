@@ -1,0 +1,161 @@
+// Recordatorios:
+// 1. Revisa las políticas onDelete (Cascade, SetNull, Restrict) para cada relación.
+// 2. Si tenías datos en la tabla antigua 'chat_messages', necesitas un script de migración ANTES de aplicar este schema.
+// 3. Ejecuta los comandos después de guardar:
+//    npx prisma format
+//    npx prisma generate
+//    npx prisma migrate dev --name integrate-final-chat-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// --- MODELOS CENTRALES ---
+
+model User {
+  id              Int     @id @default(autoincrement())
+  firstName       String?
+  lastName        String?
+  email           String  @unique
+  passwordHash    String
+  profileImageUrl String?
+
+  // Relaciones con entidades de clasificación/ubicación
+  role       Role?     @relation(fields: [roleId], references: [id], onDelete: SetNull) // Si se borra el rol, el user queda sin rol
+  roleId     Int?
+  emailVerified      Boolean @default(false)
+  isActive           Boolean @default(true) // Para desactivar usuarios sin borrarlos
+
+  // Tokens para verificación/reseteo
+  emailVerificationToken          String?   @unique
+  emailVerificationTokenExpiresAt DateTime?
+  passwordResetToken              String?   @unique
+  passwordResetTokenExpiresAt     DateTime?
+
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  activityLogs  ActivityLog[] // Logs de actividad del usuario
+  sessions      UserSession[] // Sesiones activas del usuario
+  refreshTokens RefreshToken[] // Refresh tokens asociados al usuario
+
+  // --- NUEVAS RELACIONES DE CHAT ---
+  participants Participant[] // Conversaciones en las que participa
+  sentMessages Message[]     @relation("SenderMessages") // Mensajes enviados por el usuario
+
+  @@index([roleId])
+  @@map("users") // Mapeo a tu tabla existente si el nombre difiere
+}
+
+model RefreshToken {
+  id            Int         @id @default(autoincrement())
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade) // Si se borra el user, se borran sus refresh tokens
+  userId        Int
+  tokenHash     String      @unique // Nunca guardes el token en texto plano
+  userSession   UserSession @relation(fields: [userSessionId], references: [id], onDelete: Cascade) // Si se borra la sesión, se borra su refresh token
+  userSessionId Int         @unique // Cada sesión solo puede tener un refresh token activo
+  createdAt     DateTime    @default(now())
+  expiresAt     DateTime
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model UserSession {
+  id           Int           @id @default(autoincrement())
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade) // Si se borra el user, se borran sus sesiones
+  userId       Int
+  ipAddress    String?
+  userAgent    String?       @db.Text // User agent puede ser largo
+  lastSeenAt   DateTime      @updatedAt // Se actualiza automáticamente
+  createdAt    DateTime      @default(now())
+  refreshToken RefreshToken? // Relación inversa a RefreshToken
+
+  @@index([userId, lastSeenAt(sort: Desc)]) // Útil para buscar sesiones recientes de un usuario
+  @@map("user_sessions")
+}
+
+// --- MODELOS DE CLASIFICACIÓN Y UBICACIÓN ---
+
+model Role {
+  id   Int    @id @default(autoincrement())
+  name String @unique
+
+  users User[]
+
+  @@map("roles")
+}
+
+// --- MODELOS DE LOGGING ---
+
+model ActivityLog {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade) // Si se borra el user, se borran sus logs
+  userId    Int
+  type      String // Ej: "login", "profile_update", "message_sent", "group_join"
+  metadata  Json? // Datos adicionales en formato JSON
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([type])
+  @@map("activity_logs")
+}
+
+// --- NUEVOS MODELOS PARA EL CHAT ---
+
+model Conversation {
+  id        Int      @id @default(autoincrement())
+  name      String? // Nombre para chats grupales (puede heredar del Group si está vinculado y es null aquí)
+  isGroup   Boolean  @default(false) // TRUE si > 2 participantes, incluso si no está vinculado a un Group formal
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt // Se actualiza con cada mensaje nuevo para ordenar conversaciones
+
+  // Relaciones principales del chat
+  messages     Message[] // Mensajes de esta conversación
+  participants Participant[] // Quiénes están en esta conversación
+
+  @@map("conversations")
+}
+
+// Tabla intermedia para la relación muchos-a-muchos User <-> Conversation
+model Participant {
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade) // Si se borra el User, se eliminan sus participaciones
+  userId         Int
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade) // Si se borra la Conversation, se eliminan sus participantes
+  conversationId Int
+  joinedAt       DateTime     @default(now())
+  lastReadAt     DateTime? // Futuro: Para marcar cuándo leyó por última vez
+
+  @@id([userId, conversationId]) // Clave primaria compuesta
+  @@index([userId]) // Para buscar las conversaciones de un usuario
+  @@index([conversationId]) // Para buscar los participantes de una conversación
+  @@map("participants")
+}
+
+model Message {
+  id        Int      @id @default(autoincrement())
+  content   String   @db.Text // Contenido del mensaje
+  createdAt DateTime @default(now())
+
+  // Quién envió y a qué conversación pertenece
+  sender         User         @relation("SenderMessages", fields: [senderId], references: [id], onDelete: Cascade) // Si se borra el User, se borran sus mensajes enviados
+  senderId       Int
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade) // Si se borra la Conversation, se borran sus mensajes
+  conversationId Int
+
+  // Funcionalidad de Respuestas (Threading)
+  parentMessage   Message?  @relation("Replies", fields: [parentMessageId], references: [id], onDelete: SetNull) // Si el mensaje original se borra, la respuesta apunta a null
+  parentMessageId Int? // FK opcional al mensaje al que se responde
+  replies         Message[] @relation("Replies") // Lista de mensajes que responden a ESTE mensaje
+
+  @@index([conversationId, createdAt(sort: Desc)]) // ÍNDICE CLAVE para cargar mensajes por conversación eficientemente
+  @@index([senderId]) // Para buscar mensajes de un usuario específico
+  @@index([parentMessageId]) // Para buscar respuestas a un mensaje específico
+  @@map("messages")
+}
